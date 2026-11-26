@@ -1,0 +1,41 @@
+package pe.edu.idat.essaludmiconsulta.security;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.web.AuthenticationEntryPoint;
+import org.springframework.stereotype.Component;
+import tools.jackson.databind.ObjectMapper;
+
+import java.io.IOException;
+import java.time.LocalDateTime;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * Se dispara cuando el request no trae token (o es inválido) y el endpoint
+ * requiere autenticación. Devuelve JSON en vez del HTML por defecto de
+ * Spring, para que el frontend en React pueda parsear el error fácilmente.
+ */
+@Component
+public class JwtAuthenticationEntryPoint implements AuthenticationEntryPoint {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Override
+    public void commence(HttpServletRequest request, HttpServletResponse response,
+                         AuthenticationException authException) throws IOException {
+
+        response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+        response.setContentType("application/json");
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("timestamp", LocalDateTime.now().toString());
+        body.put("status", 401);
+        body.put("error", "No autenticado");
+        body.put("mensaje", "Debes iniciar sesión para acceder a este recurso.");
+        body.put("path", request.getRequestURI());
+
+        objectMapper.writeValue(response.getOutputStream(), body);
+    }
+}

@@ -1,0 +1,261 @@
+
+Query · MYSQL
+-- =====================================================================
+-- Sistema de Autoagendamiento de Citas Médicas - "Mi Consulta Extendida"
+-- Motor: MySQL 8.0+ (compatible con MySQL Workbench)
+-- =====================================================================
+
+CREATE DATABASE IF NOT EXISTS miconsulta_db
+    CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE miconsulta_db;
+
+-- ---------------------------------------------------------------------
+-- Tabla: especialidad
+-- ---------------------------------------------------------------------
+CREATE TABLE especialidad (
+    id_especialidad     INT AUTO_INCREMENT PRIMARY KEY,
+    nombre              VARCHAR(100) NOT NULL,
+    descripcion         VARCHAR(255),
+    activo              TINYINT(1) NOT NULL DEFAULT 1,
+    CONSTRAINT uq_especialidad_nombre UNIQUE (nombre)
+) ENGINE=InnoDB;
+
+-- ---------------------------------------------------------------------
+-- Tabla: paciente  (identificador natural: DNI)
+-- ---------------------------------------------------------------------
+CREATE TABLE paciente (
+    dni                 CHAR(8) PRIMARY KEY,
+    nombres             VARCHAR(100) NOT NULL,
+    apellido_paterno    VARCHAR(80) NOT NULL,
+    apellido_materno    VARCHAR(80) NOT NULL,
+    fecha_nacimiento    DATE NOT NULL,
+    tipo_seguro         ENUM('REGULAR', 'POTESTATIVO', 'AGRARIO', 'INDEPENDIENTE', 'SIS', 'PUBLICO', 'PRIVADO') NOT NULL,
+    correo              VARCHAR(150),
+    telefono            VARCHAR(20),
+    centro_asistencial  VARCHAR(150),
+    afiliacion_activa   BOOLEAN NOT NULL DEFAULT TRUE, -- RN-01
+    fecha_registro      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_dni_formato CHECK (dni REGEXP '^[0-9]{8}$')
+) ENGINE=InnoDB;
+
+-- ---------------------------------------------------------------------
+-- Tabla: medico  (identificador natural: CMP - Colegio Médico del Perú)
+-- ---------------------------------------------------------------------
+CREATE TABLE medico (
+    cmp                 VARCHAR(10) PRIMARY KEY,
+    nombres             VARCHAR(100) NOT NULL,
+    apellido_paterno    VARCHAR(80) NOT NULL,
+    apellido_materno    VARCHAR(80) NOT NULL,
+    id_especialidad     INT NOT NULL,
+    centro_asistencial  VARCHAR(150) NOT NULL,
+    activo              TINYINT(1) NOT NULL DEFAULT 1,
+    CONSTRAINT fk_medico_especialidad
+        FOREIGN KEY (id_especialidad) REFERENCES especialidad(id_especialidad)
+) ENGINE=InnoDB;
+
+-- ---------------------------------------------------------------------
+-- Tabla: horario_medico  (turnos / slots ofertados por el médico)
+-- ---------------------------------------------------------------------
+CREATE TABLE horario_medico (
+    id_horario          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    cmp_medico          VARCHAR(10) NOT NULL,
+    fecha               DATE NOT NULL,
+    hora_inicio         TIME NOT NULL,
+    hora_fin            TIME NOT NULL,
+    estado              ENUM('DISPONIBLE', 'RESERVADO', 'CANCELADO', 'BLOQUEADO') NOT NULL DEFAULT 'DISPONIBLE',
+    liberado_por_cancelacion BOOLEAN NOT NULL DEFAULT FALSE, -- HU-12
+    version             INT NOT NULL DEFAULT 0,  -- para bloqueo optimista (evita doble reserva)
+    fecha_actualizacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_horario_medico
+        FOREIGN KEY (cmp_medico) REFERENCES medico(cmp),
+    CONSTRAINT chk_horario_rango CHECK (hora_fin > hora_inicio),
+    CONSTRAINT uq_horario_medico_slot UNIQUE (cmp_medico, fecha, hora_inicio)
+) ENGINE=InnoDB;
+
+-- ---------------------------------------------------------------------
+-- Tabla: usuario  (credenciales de login; separada de paciente/medico
+-- porque un mismo DNI/CMP puede no tener cuenta, y porque el rol ADMIN
+-- no tiene ni paciente ni médico asociado)
+-- ---------------------------------------------------------------------
+CREATE TABLE usuario (
+    id_usuario      BIGINT AUTO_INCREMENT PRIMARY KEY,
+    username        VARCHAR(50) NOT NULL,
+    password_hash   VARCHAR(255) NOT NULL,
+    rol             ENUM('PACIENTE', 'MEDICO', 'ADMIN') NOT NULL,
+    dni_paciente    CHAR(8),       -- solo cuando rol = PACIENTE
+    cmp_medico      VARCHAR(10),   -- solo cuando rol = MEDICO
+    activo          TINYINT(1) NOT NULL DEFAULT 1,
+    fecha_creacion  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_usuario_username UNIQUE (username),
+    CONSTRAINT fk_usuario_paciente FOREIGN KEY (dni_paciente) REFERENCES paciente(dni),
+    CONSTRAINT fk_usuario_medico FOREIGN KEY (cmp_medico) REFERENCES medico(cmp)
+) ENGINE=InnoDB;
+
+-- ---------------------------------------------------------------------
+-- Tabla: cita
+-- ---------------------------------------------------------------------
+CREATE TABLE cita (
+    id_cita               BIGINT AUTO_INCREMENT PRIMARY KEY,
+    dni_paciente          CHAR(8) NOT NULL,
+    id_horario            BIGINT NOT NULL,
+    fecha_registro        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    fecha_confirmacion    TIMESTAMP NULL,
+    estado                ENUM('PENDIENTE', 'CONFIRMADA', 'CANCELADA', 'ASISTIO', 'NO_ASISTIO', 'PENDIENTE_REPROGRAMACION') NOT NULL DEFAULT 'PENDIENTE',
+    motivo_cancelacion    VARCHAR(255),
+    -- HU-11: motivo de la propuesta de reprogramación (EFI). Las opciones
+    -- de horario propuestas viven en cita_opcion_reprogramacion, no acá
+    -- (una cita puede tener varias opciones para que el paciente elija).
+    motivo_reprogramacion VARCHAR(255),
+    CONSTRAINT fk_cita_paciente
+        FOREIGN KEY (dni_paciente) REFERENCES paciente(dni),
+    CONSTRAINT fk_cita_horario
+        FOREIGN KEY (id_horario) REFERENCES horario_medico(id_horario)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_cita_horario ON cita (id_horario);
+
+-- ---------------------------------------------------------------------
+-- Tabla: cita_opcion_reprogramacion
+-- HU-11: cada horario que el área administrativa (EFI) ofrece como
+-- alternativa al proponer una reprogramación. Una cita puede tener varias
+-- opciones; el paciente elige una sola al aceptar y las demás se liberan.
+-- ---------------------------------------------------------------------
+CREATE TABLE cita_opcion_reprogramacion (
+    id_opcion    BIGINT AUTO_INCREMENT PRIMARY KEY,
+    id_cita      BIGINT NOT NULL,
+    id_horario   BIGINT NOT NULL,
+    CONSTRAINT fk_opcion_cita
+        FOREIGN KEY (id_cita) REFERENCES cita(id_cita),
+    CONSTRAINT fk_opcion_horario
+        FOREIGN KEY (id_horario) REFERENCES horario_medico(id_horario),
+    CONSTRAINT uq_opcion_cita_horario UNIQUE (id_cita, id_horario)
+) ENGINE=InnoDB;
+
+CREATE INDEX idx_opcion_cita ON cita_opcion_reprogramacion (id_cita);
+
+-- ---------------------------------------------------------------------
+-- Tabla: lista_espera
+-- ---------------------------------------------------------------------
+CREATE TABLE lista_espera (
+    id_lista_espera     BIGINT AUTO_INCREMENT PRIMARY KEY,
+    dni_paciente        CHAR(8) NOT NULL,
+    id_especialidad     INT NOT NULL,
+    fecha_registro      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    fecha_notificacion  TIMESTAMP NULL,
+    estado              ENUM('ACTIVO', 'NOTIFICADO', 'ATENDIDO', 'EXPIRADO') NOT NULL DEFAULT 'ACTIVO',
+    CONSTRAINT fk_espera_paciente
+        FOREIGN KEY (dni_paciente) REFERENCES paciente(dni),
+    CONSTRAINT fk_espera_especialidad
+        FOREIGN KEY (id_especialidad) REFERENCES especialidad(id_especialidad),
+    CONSTRAINT uq_espera_paciente_especialidad UNIQUE (dni_paciente, id_especialidad, estado)
+) ENGINE=InnoDB;
+
+-- =====================================================================
+-- ÍNDICES DE RENDIMIENTO
+-- Pensados para el patrón de acceso masivo y concurrente del sistema:
+--  - Búsqueda de cupos disponibles por especialidad/fecha (lectura masiva)
+--  - Liberación/expiración de citas (job batch cada minuto)
+--  - Notificación FIFO de lista de espera
+-- =====================================================================
+
+CREATE TABLE requisito (
+    id_requisito INT AUTO_INCREMENT PRIMARY KEY,
+    nombre       VARCHAR(150) NOT NULL,
+    descripcion  VARCHAR(255),
+    CONSTRAINT uq_requisito_nombre UNIQUE (nombre)
+) ENGINE=InnoDB;
+
+CREATE TABLE especialidad_requisito (
+    id_especialidad INT NOT NULL,
+    id_requisito    INT NOT NULL,
+    obligatorio     TINYINT(1) NOT NULL DEFAULT 1,
+    PRIMARY KEY (id_especialidad, id_requisito),
+    CONSTRAINT fk_esprequi_especialidad FOREIGN KEY (id_especialidad)
+        REFERENCES especialidad (id_especialidad),
+    CONSTRAINT fk_esprequi_requisito FOREIGN KEY (id_requisito)
+        REFERENCES requisito (id_requisito)
+) ENGINE=InnoDB;
+
+-- ---------------------------------------------------------------------
+-- Tabla: informacion_general  (HU-08 / RF-10)
+-- Contenido informativo sobre el proceso de agendamiento y atención,
+-- administrado directamente en BD (sin CRUD, mismo criterio que
+-- especialidad/médico/horario en este alcance).
+-- ---------------------------------------------------------------------
+CREATE TABLE informacion_general (
+    id_informacion INT AUTO_INCREMENT PRIMARY KEY,
+    titulo         VARCHAR(150) NOT NULL,
+    contenido      TEXT NOT NULL,
+    categoria      VARCHAR(50),
+    orden          INT NOT NULL DEFAULT 0,
+    activo         TINYINT(1) NOT NULL DEFAULT 1
+) ENGINE=InnoDB;
+
+INSERT INTO informacion_general (titulo, contenido, categoria, orden, activo) VALUES
+    ('¿Cómo agendo una cita médica?',
+     'Ingresa a la plataforma, selecciona la especialidad y el establecimiento de tu preferencia, elige un médico y un horario disponible, y confirma el agendamiento. Recibirás una confirmación por correo electrónico.',
+     'AGENDAMIENTO', 1, 1),
+    ('¿Qué pasa si no confirmo mi cita?',
+     'El área administrativa de EsSalud se comunicará contigo por teléfono para confirmar tu cita antes de la fecha de atención — ya no es necesario que la confirmes tú desde la plataforma. Si no logran contactarte y confirmarla, y faltan menos de 24 horas para la cita, esta se cancelará automáticamente y el cupo quedará disponible para otro asegurado. Puedes revisar el estado de tu cita (Pendiente o Confirmada) en "Mis Citas".',
+     'AGENDAMIENTO', 2, 1),
+    ('¿Puedo cancelar mi cita?',
+     'Sí, puedes cancelarla tú mismo desde "Mis Citas", siempre que falten más de 24 horas para la atención. Si necesitas un nuevo horario, puedes agendar una cita nueva, o esperar a que el área administrativa te contacte si tu cita actual necesita reprogramarse.',
+     'GESTION_CITAS', 1, 1),
+    ('¿Puedo ver la agenda de mi médico de cabecera?',
+     'Sí. Si ya tienes un médico de tu preferencia, ingresa a la sección "Agenda de Médico" para consultar los días y horarios que tiene programados durante el mes. Es solo informativo: no reserva ni asigna ningún cupo, pero te sirve para planificar con anticipación cuándo intentar agendar tu próxima cita con él o ella.',
+     'AGENDAMIENTO', 3, 1),
+    ('¿Qué pasa si el centro de salud me propone reprogramar mi cita?',
+     'Si el médico no va a atender en la fecha programada (por ejemplo, por vacaciones), el área administrativa te propondrá una o varias opciones de nuevo horario y te llegará un correo avisándote. Ingresa a EsSalud Mi Consulta y ve a "Mis Citas": ahí vas a ver tu cita marcada como "Reprogramación pendiente", con esas mismas opciones para que elijas la que prefieras y la aceptes, o rechaces todas si ninguna te sirve. Mientras no elijas una opción, tu cita queda pendiente.',
+     'GESTION_CITAS', 3, 1),
+    ('¿Debo llevar algún requisito a mi cita?',
+     'Depende de la especialidad y el tipo de atención. Consulta los requisitos y recomendaciones específicos en el detalle de tu cita antes de asistir.',
+     'ATENCION', 1, 1);
+
+-- ---------------------------------------------------------------------
+-- Datos de prueba (ajusta id_especialidad si el tuyo no es 1)
+-- ---------------------------------------------------------------------
+INSERT INTO requisito (nombre, descripcion) VALUES
+    ('Radiografía de tórax', 'Vigencia máxima de 30 días'),
+    ('Análisis de sangre completo', 'Hemograma reciente, vigencia máxima de 15 días');
+
+-- Vincula ambos requisitos a la especialidad con id_especialidad = 1
+-- (la creada en seed_datos_prueba.sql: "Medicina General")
+INSERT INTO especialidad_requisito (id_especialidad, id_requisito, obligatorio) VALUES
+    (1, 1, 1),  -- radiografía obligatoria
+    (1, 2, 0);  -- análisis de sangre recomendado, no obligatorio
+
+-- Búsqueda rápida de horarios disponibles por médico/fecha (pantalla de agendamiento)
+CREATE INDEX idx_horario_estado_fecha
+    ON horario_medico (estado, fecha, hora_inicio);
+
+-- Acelera el JOIN horario_medico -> medico dentro de la búsqueda por especialidad
+CREATE INDEX idx_horario_medico_cmp
+    ON horario_medico (cmp_medico, estado);
+
+-- Búsqueda de médicos activos por especialidad
+CREATE INDEX idx_medico_especialidad
+    ON medico (id_especialidad, activo);
+
+-- Job de "no confirmación 24h antes": localizar citas pendientes por vencer
+CREATE INDEX idx_cita_estado_registro
+    ON cita (estado, fecha_registro);
+
+-- Acceso directo por paciente (historial / "mis citas")
+CREATE INDEX idx_cita_paciente
+    ON cita (dni_paciente, estado);
+
+-- Cola de espera: siguiente candidato a notificar (orden FIFO) por especialidad activa
+CREATE INDEX idx_espera_especialidad_estado_fecha
+    ON lista_espera (id_especialidad, estado, fecha_registro);
+
+-- Búsqueda de la posición de un paciente en su cola de espera
+CREATE INDEX idx_espera_paciente_estado
+    ON lista_espera (dni_paciente, estado);
+
+
+
+
+
+
+
+
